@@ -91,7 +91,7 @@ class Validator(object):
             self._TYPES, string=string_types, number=number_types
         )
         self._types[u"any"] = tuple(self._types.values())
-
+        
     def _error(self, msg):
         """
         Something failed to validate. ``msg`` will have details.
@@ -158,6 +158,7 @@ class Validator(object):
             validator(v, instance, schema)
 
     def validate(self, instance, schema):
+        self._subschemas = schema['properties']
         self._errors = []
         self._validate(instance, schema)
         if self._errors:
@@ -198,6 +199,13 @@ class Validator(object):
         else:
             self._error(u"%r is not of type %s" % (instance, _delist(types)))
 
+    def validate_extends(self, name, instance, schema):
+        subschema = self._subschemas.get(name, None)
+        if subschema is None:
+            self._error(u"cannot extend unknown schema "+name)
+        else:
+            self._validate(instance, subschema)
+                
     def validate_properties(self, properties, instance, schema):
         for property, subschema in properties.iteritems():
             if property in instance:
