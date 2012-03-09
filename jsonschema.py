@@ -26,7 +26,7 @@ import types
 import warnings
 
 
-__version__ = "0.1a"
+__version__ = "0.2"
 
 try:  # pragma: no cover, 2.5 support
     next
@@ -82,6 +82,27 @@ class Validator(object):
         unknown_property="error", string_types=basestring,
         number_types=(int, float)
     ):
+        """
+        Initialize a Validator.
+
+        If ``stop_on_error`` is ``True`` (default), immediately stop validation
+        when an error occurs. Otherwise, wait until validation is completed,
+        then display all validation errors at once.
+
+        ``unknown_type`` and ``unknown_property`` control what to do when an
+        unknown type (resp. property) is encountered. By default an error is
+        raised (``"error"``). Other valid inputs are ``"warn"``, raising a
+        warning, and ``"skip"`` to ignore.
+
+        ``string_types`` and ``number_types`` control which Python types are
+        considered to be JSON ``String``s and ``Number``s respectively. By
+        default, ``basestring`` (which means, ``str`` + ``unicode``) is used
+        for ``string_types``, and ``int`` and ``float`` are the number_types.
+        To override this behavior (e.g. for ``decimal.Decimal``), provide a
+        type or tuple of types to use (*including* the default types if so
+        desired).
+
+        """
 
         self.stop_on_error = stop_on_error
         self._unknown_type = unknown_type
@@ -91,7 +112,36 @@ class Validator(object):
             self._TYPES, string=string_types, number=number_types
         )
         self._types[u"any"] = tuple(self._types.values())
-        
+
+    def _is_type(self, instance, type):
+        """
+        Check if an ``instance`` is of the provided ``type``.
+
+        """
+
+        py_type = self._types.get(type)
+
+        if py_type is None:
+            return self._schema_error(
+                self._unknown_type, u"%r is not a known type" % (type,)
+            )
+
+        # the only thing we're careful about here is evading bool inheriting
+        # from int, so let's be even dirtier than usual
+
+        elif (
+            # it's not a bool, so no worries
+            not isinstance(instance, bool) or
+
+            # it is a bool, but we're checking for a bool, so no worries
+            (
+                py_type is bool or
+                isinstance(py_type, tuple) and bool in py_type
+            )
+
+        ):
+            return isinstance(instance, py_type)
+
     def _error(self, msg):
         """
         Something failed to validate. ``msg`` will have details.
@@ -141,11 +191,10 @@ class Validator(object):
         Validate an ``instance`` under the given ``schema``.
 
         """
-
         for k, v in schema.iteritems():
             if k in self._SKIPPED:
                 continue
-
+            #print("validate_%s" % (k,))
             validator = getattr(self, u"validate_%s" % (k,), None)
 
             if validator is None:
@@ -156,6 +205,7 @@ class Validator(object):
                 return
 
             validator(v, instance, schema)
+            #    self._error("%r is invalid" % (instance,))
 
     def validate(self, instance, schema):
         self._subschemas = schema['properties']
@@ -169,35 +219,21 @@ class Validator(object):
 
     def validate_type(self, types, instance, schema):
         types = _list(types)
-
-        for type in types:
-            if (
-                isinstance(type, dict) and
-                isinstance(instance, dict) and
-                self.is_valid(instance, type)
-            ):
-                return
-
-            elif isinstance(type, basestring):
-                py_type = self._types.get(type)
-
-                if py_type is None:
-                    self._schema_error(
-                        self._unknown_type, u"%r is not a known type" % (type,)
-                    )
-                    return
-
-                # isinstance(a_bool, int) will make us even sadder here, so
-                # let's be even dirtier than we would otherwise be.
-
-                elif (
-                    isinstance(instance, py_type) and
-                    (not isinstance(instance, bool) or
-                     py_type is bool or types == [u"any"])
-                ):
-                        return
-        else:
-            self._error(u"%r is not of type %s" % (instance, _delist(types)))
+        for type_ in types:
+            # Ouch. Brain hurts. Two paths here, either we have a schema, then
+            # check if the instance is valid under it
+            if (self._is_type(type_, "object") and
+                self._is_type(instance, "object") and
+                self.is_valid(instance, type_)):
+                return True
+            # Or we have a type as a string, just check if the instance is that
+            # type. Also, HACK: we can reach the `or` here if skip_types is
+            # something other than error. If so, bail out.
+            if (self._is_type(type_, "string") and
+                (self._is_type(instance, type_) or type_ not in self._types)):
+                return True
+        self._error(u"%r is not of type %r" % (instance, _delist(types)))
+        return False
 
     def validate_extends(self, name, instance, schema):
         subschema = self._subschemas.get(name, None)
@@ -205,22 +241,21 @@ class Validator(object):
             self._error(u"cannot extend unknown schema "+name)
         else:
             self._validate(instance, subschema)
-                
+
     def validate_properties(self, properties, instance, schema):
         for property, subschema in properties.iteritems():
             if property in instance:
                 dependencies = _list(subschema.get(u"dependencies", []))
-                if isinstance(dependencies, dict):
-                    self._validate(instance, dependencies)
+                if self._is_type(dependencies, "object"):
+                    result = self._validate(instance, dependencies)
                 else:
                     missing = (d for d in dependencies if d not in instance)
                     first = next(missing, None)
                     if first is not None:
-                        self._error(
-                            u"%r is a dependency of %r" % (first, property)
-                        )
-
-                self._validate(instance[property], subschema)
+                        self._error(u"%r is a dependency of %r" % 
+                                    (first, property))
+                        result = False
+                result = self._validate(instance[property], subschema)
             elif subschema.get(u"required", False):
                 self._error(u"%r is a required property" % (property,))
 
@@ -232,16 +267,18 @@ class Validator(object):
 
     def validate_additionalProperties(self, aP, instance, schema):
         # no viewkeys in <2.7, and pypy seems to fail on vk - vk anyhow, so...
-        extras = set(instance) - set(schema.get(u"properties", {}))
+        props = set(schema.get(u"properties", {}))
+        extras = set(instance) - props
 
-        if isinstance(aP, dict):
+        if self._is_type(aP, "object"):
             for extra in extras:
                 self._validate(instance[extra], aP)
         elif not aP and extras:
-            self._error(u"Additional properties are not allowed")
+            self._error(u"Properties [{0}] not in [{1}]".
+                        format(u",".join(extras), u",".join(props)))
 
     def validate_items(self, items, instance, schema):
-        if isinstance(items, dict):
+        if self._is_type(items, "object"):
             for item in instance:
                 self._validate(item, items)
         else:
@@ -249,7 +286,7 @@ class Validator(object):
                 self._validate(item, subschema)
 
     def validate_additionalItems(self, aI, instance, schema):
-        if isinstance(aI, dict):
+        if self._is_type(aI, "object"):
             for item in instance[len(schema):]:
                 self._validate(item, aI)
         elif not aI and len(instance) > len(schema):
@@ -265,7 +302,7 @@ class Validator(object):
 
         if failed:
             self._error(
-                u"%s is %s the minimum of %s" % (instance, cmp, minimum)
+                u"%r is %s the minimum of %r" % (instance, cmp, minimum)
             )
 
     def validate_maximum(self, maximum, instance, schema):
@@ -278,27 +315,27 @@ class Validator(object):
 
         if failed:
             self._error(
-                u"%s is %s the maximum of %s" % (instance, cmp, maximum)
+                u"%r is %s the maximum of %r" % (instance, cmp, maximum)
             )
 
     def validate_minItems(self, mI, instance, schema):
-        if len(instance) < mI:
+        if self._is_type(instance, "array") and len(instance) < mI:
             self._error(u"%r is too short" % (instance,))
 
     def validate_maxItems(self, mI, instance, schema):
-        if len(instance) > mI:
+        if self._is_type(instance, "array") and len(instance) > mI:
             self._error(u"%r is too long" % (instance,))
 
-    def validate_pattern(self, pattern, instance, schema):
-        if not re.match(pattern, instance):
-            self._error(u"%r does not match %r" % (instance, pattern))
+    def validate_pattern(self, patrn, instance, schema):
+        if self._is_type(instance, "string") and not re.match(patrn, instance):
+            self._error(u"%r does not match %r" % (instance, patrn))
 
     def validate_minLength(self, mL, instance, schema):
-        if len(instance) < mL:
+        if self._is_type(instance, "string") and len(instance) < mL:
             self._error(u"%r is too short" % (instance,))
 
     def validate_maxLength(self, mL, instance, schema):
-        if len(instance) > mL:
+        if self._is_type(instance, "string") and len(instance) > mL:
             self._error(u"%r is too long" % (instance,))
 
     def validate_enum(self, enums, instance, schema):
@@ -312,7 +349,7 @@ class Validator(object):
             failed = instance % dB
 
         if failed:
-            self._error(u"%s is not divisible by %s" % (instance, dB))
+            self._error(u"%r is not divisible by %r" % (instance, dB))
 
     def validate_disallow(self, disallow, instance, schema):
         disallow = _list(disallow)
